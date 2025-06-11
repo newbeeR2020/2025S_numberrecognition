@@ -1,10 +1,15 @@
+# main.py
+import io
+from pathlib import Path
+
 import streamlit as st
 import torch
 import torch.nn as nn
-import numpy as np
-from PIL import Image, ImageOps
+import torchvision.transforms as T
+from PIL import Image
 
-# モデルの定義
+
+# ――― モデル定義 ――― #
 class SimpleMLP(nn.Module):
     def __init__(self):
         super().__init__()
@@ -12,38 +17,67 @@ class SimpleMLP(nn.Module):
         self.fc2 = nn.Linear(128, 10)
 
     def forward(self, x):
-        x_reshaped = x.view(x.shape[0], -1)
-        h = self.fc1(x_reshaped)
-        z = torch.sigmoid(h)
-        y_hat = self.fc2(z)
-        return y_hat
+        x = x.view(x.size(0), -1)  # [B, 784]
+        h = torch.sigmoid(self.fc1(x))
+        return self.fc2(h)
 
-# デバイス設定
+
+# ――― モデル読み込み ――― #
+@st.cache_resource(show_spinner=True)
+def load_model(weight_path: Path, device: torch.device):
+    model = SimpleMLP().to(device)
+    try:  # PyTorch ≥ 2.2
+        state_dict = torch.load(weight_path, map_location=device, weights_only=True)
+    except TypeError:  # それ以前
+        state_dict = torch.load(weight_path, map_location=device)
+    model.load_state_dict(state_dict)
+    model.eval()
+    return model
+
+
+# ――― 画像前処理 ――― #
+transform = T.Compose([
+    T.Grayscale(num_output_channels=1),      # 1ch 28×28
+    T.Resize((28, 28)),
+    T.ToTensor(),                            # [0-1] へ変換
+])
+
+
+def preprocess(img_bytes: bytes, device: torch.device):
+    image = Image.open(io.BytesIO(img_bytes)).convert("L")
+    tensor = transform(image).unsqueeze(0).to(device)  # [1, 1, 28, 28]
+    return tensor, image
+
+
+# ――― Streamlit UI ――― #
+st.set_page_config(page_title="MNIST Digit Classifier", layout="centered")
+st.title("手書き数字分類 (Simple MLP)")
+
+uploaded = st.file_uploader(
+    "28×28 px または任意サイズのモノクロ／カラー PNG・JPEG をアップロードしてください",
+    type=["png", "jpg", "jpeg"],
+)
+
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+model_path = Path("modelwithBatch.pth")
 
-# モデルのロード
-model = SimpleMLP().to(device)
-model.load_state_dict(torch.load("modelwithBatch.pth", map_location=device))
-model.eval()
+if not model_path.exists():
+    st.error(f"{model_path} が見つかりません。ファイルを同じフォルダに置いてください。")
+    st.stop()
 
-st.title("手書き数字分類 (MNIST)")
+model = load_model(model_path, device)
 
-uploaded_file = st.file_uploader("28x28の手書き数字画像（白地に黒字）をアップロードしてください", type=["png", "jpg", "jpeg"])
-
-if uploaded_file is not None:
-    image = Image.open(uploaded_file).convert("L")  # グレースケール化
-    image = ImageOps.invert(image)  # 白黒反転（MNIST形式に合わせる）
-    image = image.resize((28, 28))  # サイズ調整
-
-    st.image(image, caption="入力画像", width=150)
-
-    image_tensor = torch.tensor(np.array(image), dtype=torch.float32) / 255.0
-    image_tensor = image_tensor.unsqueeze(0).unsqueeze(0).to(device)  # (1, 1, 28, 28)
-
+if uploaded is not None:
+    tensor, pil_img = preprocess(uploaded.getvalue(), device)
     with torch.no_grad():
-        output = model(image_tensor)
-        probabilities = torch.softmax(output, dim=1)
-        _, predicted = torch.max(probabilities, 1)
+        logits = model(tensor)
+        probs = torch.softmax(logits, dim=1).cpu().squeeze()
 
-    st.write(f"**予測された数字:** {predicted.item()}")
-    st.bar_chart(probabilities.squeeze().cpu().numpy())
+    pred = int(torch.argmax(probs))
+    st.image(pil_img.resize((140, 140)), caption=f"予測: {pred}", clamp=True)
+
+    st.subheader("各クラス確率")
+    st.bar_chart({str(i): float(probs[i]) for i in range(10)})
+else:
+    st.info("左のボタンから画像を選択してください。")
+
